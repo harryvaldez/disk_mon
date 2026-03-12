@@ -1,0 +1,62 @@
+[
+  {
+    "headers": {
+      "host": "claritasllc.app.n8n.cloud",
+      "user-agent": "Linux-Disk-Monitor-Bash/1.0",
+      "content-length": "1032",
+      "accept": "*/*",
+      "accept-encoding": "gzip, br",
+      "cdn-loop": "cloudflare; loops=1; subreqs=1",
+      "cf-connecting-ip": "20.12.178.118",
+      "cf-ew-via": "15",
+      "cf-ipcountry": "US",
+      "cf-ray": "99dfd62be54e7438-MIA",
+      "cf-visitor": "{\"scheme\":\"https\"}",
+      "cf-worker": "n8n.cloud",
+      "content-type": "application/json",
+      "x-forwarded-for": "20.12.178.118, 172.69.132.195",
+      "x-forwarded-host": "claritasllc.app.n8n.cloud",
+      "x-forwarded-port": "443",
+      "x-forwarded-proto": "https",
+      "x-forwarded-server": "traefik-prod-users-gwc-4-644c4bcdb9-55ggx",
+      "x-is-trusted": "yes",
+      "x-real-ip": "20.12.178.118"
+    },
+    "params": {},
+    "query": {},
+    "body": {
+      "server_name": "smsstgdba01.reddog.microsoft.com",
+      "server_ip": "10.203.2.5",
+      "timestamp": "2025-11-13T17:02:24+0000",
+      "disks": [
+        {
+          "device": "/dev/sda2",
+          "mountpoint": "/",
+          "fstype": "",
+          "total_gb": 31.49,
+          "used_gb": 15.56,
+          "free_gb": 15.92,
+          "usage_percent": 50,
+          "timestamp": "2025-11-13T17:02:23+0000"
+        },
+        {
+          "device": "/dev/mapper/data--vg01-data--lv01",
+          "mountpoint": "/data",
+          "fstype": "",
+          "total_gb": 11905.24,
+          "used_gb": 5029.79,
+          "free_gb": 6275.43,
+          "usage_percent": 45,
+          "timestamp": "2025-11-13T17:02:24+0000"
+        }
+      ],
+      "health_info": {
+        "inode_usage": []
+      },
+      "os_type": "linux",
+      "os_version": "Red Hat Enterprise Linux Server release 7.9 (Maipo)"
+    },
+    "webhookUrl": "https://claritasllc.app.n8n.cloud/webhook/disk-monitor",
+    "executionMode": "production"
+  }
+]
