@@ -151,63 +151,53 @@ def send_to_webhook(
         return False
 
 
-def get_windows_remote_disks(
-    server: str,
-    username: str,
-    password: str,
-    port: int,
-    use_ssl: bool,
-    auth_transport: str,
-    validate_cert: bool,
-) -> Tuple[str, str, str, List[Dict]]:
+
+# --- Refactored Windows Disk Collection ---
+def _winrm_connect(server, username, password, port, use_ssl, auth_transport, validate_cert):
     if winrm is None:
         raise RuntimeError("pywinrm is not installed. Install with: pip install pywinrm")
-
     scheme = "https" if use_ssl else "http"
     endpoint = f"{scheme}://{server}:{port}/wsman"
-    session = winrm.Session(
+    return winrm.Session(
         endpoint,
         auth=(username, password),
         transport=auth_transport,
         server_cert_validation="validate" if validate_cert else "ignore",
     )
 
-    hostname_result = session.run_ps("$env:COMPUTERNAME")
-    if hostname_result.status_code != 0:
-        raise RuntimeError(hostname_result.std_err.decode("utf-8", errors="ignore"))
-    server_name = hostname_result.std_out.decode("utf-8", errors="ignore").strip() or server
+def _winrm_get_hostname(session, server):
+    result = session.run_ps("$env:COMPUTERNAME")
+    if result.status_code != 0:
+        raise RuntimeError(result.std_err.decode("utf-8", errors="ignore"))
+    return result.std_out.decode("utf-8", errors="ignore").strip() or server
 
-    os_result = session.run_ps(
+def _winrm_get_os_version(session):
+    result = session.run_ps(
         "(Get-CimInstance Win32_OperatingSystem).Caption + ' ' + (Get-CimInstance Win32_OperatingSystem).Version"
     )
-    if os_result.status_code != 0:
-        os_version = "Windows"
-    else:
-        os_version = os_result.std_out.decode("utf-8", errors="ignore").strip() or "Windows"
+    if result.status_code != 0:
+        return "Windows"
+    return result.std_out.decode("utf-8", errors="ignore").strip() or "Windows"
 
-    if REQUIRED_WINDOWS_OS not in os_version.lower():
-        raise RuntimeError(
-            f"Unsupported Windows version '{os_version}'. Required: Windows Server 2019 Datacenter"
-        )
-
+def _winrm_query_disks(session):
     ps_script = r"""
 $disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3 AND (DeviceID='F:' OR DeviceID='G:')" |
     Select-Object DeviceID, Size, FreeSpace, FileSystem
 $disks | ConvertTo-Json -Compress
 """
-    disks_result = session.run_ps(ps_script)
-    if disks_result.status_code != 0:
-        raise RuntimeError(disks_result.std_err.decode("utf-8", errors="ignore"))
-
-    raw = disks_result.std_out.decode("utf-8", errors="ignore").strip()
+    result = session.run_ps(ps_script)
+    if result.status_code != 0:
+        raise RuntimeError(result.std_err.decode("utf-8", errors="ignore"))
+    raw = result.std_out.decode("utf-8", errors="ignore").strip()
     if not raw:
-        return server_name, server, os_version, []
-
+        return []
     parsed = json.loads(raw)
     if isinstance(parsed, dict):
         parsed = [parsed]
+    return parsed
 
-    disk_info: List[Dict] = []
+def _normalize_win_disks(parsed):
+    disk_info = []
     for disk in parsed:
         total = float(disk.get("Size") or 0)
         free = float(disk.get("FreeSpace") or 0)
@@ -226,9 +216,118 @@ $disks | ConvertTo-Json -Compress
                 "timestamp": datetime.now().isoformat(),
             }
         )
+    return disk_info
 
+def get_windows_remote_disks(
+    server: str,
+    username: str,
+    password: str,
+    port: int,
+    use_ssl: bool,
+    auth_transport: str,
+    validate_cert: bool,
+) -> Tuple[str, str, str, List[Dict]]:
+    session = _winrm_connect(server, username, password, port, use_ssl, auth_transport, validate_cert)
+    server_name = _winrm_get_hostname(session, server)
+    os_version = _winrm_get_os_version(session)
+    if REQUIRED_WINDOWS_OS not in os_version.lower():
+        raise RuntimeError(
+            f"Unsupported Windows version '{os_version}'. Required: Windows Server 2019 Datacenter"
+        )
+    parsed = _winrm_query_disks(session)
+    disk_info = _normalize_win_disks(parsed)
     return server_name, server, os_version, disk_info
 
+
+
+# --- Refactored Linux Disk Collection ---
+def _ssh_connect(client, server, username, password, key_path, key_passphrase, allow_agent, port):
+    key_path = key_path.strip()
+    connected = False
+    last_error = None
+    if key_path:
+        expanded_key_path = os.path.expandvars(os.path.expanduser(key_path))
+        if not os.path.exists(expanded_key_path):
+            raise RuntimeError(f"SSH key file not found: {expanded_key_path}")
+        try:
+            client.connect(
+                hostname=server,
+                port=port,
+                username=username,
+                key_filename=expanded_key_path,
+                passphrase=key_passphrase or None,
+                look_for_keys=False,
+                allow_agent=allow_agent,
+                timeout=20,
+            )
+            connected = True
+        except Exception as exc:
+            last_error = exc
+            logging.warning(
+                "%s: SSH key authentication failed. %s",
+                server,
+                "Trying password fallback." if password else "No password fallback configured.",
+            )
+    if not connected and password:
+        try:
+            client.connect(
+                hostname=server,
+                port=port,
+                username=username,
+                password=password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=20,
+            )
+            connected = True
+        except Exception as exc:
+            last_error = exc
+    if not connected:
+        if last_error:
+            raise RuntimeError(f"SSH authentication failed: {last_error}")
+        raise RuntimeError("SSH authentication failed: no usable key or password provided")
+
+def _ssh_get_hostname(client, server):
+    stdin, stdout, stderr = client.exec_command("hostname")
+    server_name = stdout.read().decode("utf-8", errors="ignore").strip() or server
+    _ = stdin
+    return server_name
+
+def _ssh_get_os_version(client):
+    _, stdout, _ = client.exec_command("cat /etc/redhat-release 2>/dev/null || uname -srv")
+    return stdout.read().decode("utf-8", errors="ignore").strip() or "RHEL"
+
+def _ssh_query_data_disk(client, server):
+    _, stdout, stderr = client.exec_command("df -PkT /data 2>/dev/null | tail -n 1")
+    line = stdout.read().decode("utf-8", errors="ignore").strip()
+    err = stderr.read().decode("utf-8", errors="ignore").strip()
+    if not line:
+        if err:
+            logging.warning("%s: /data lookup warning: %s", server, err)
+        return None
+    parts = line.split()
+    if len(parts) < 7:
+        raise RuntimeError(f"Unexpected df output for {server}: {line}")
+    return parts
+
+def _normalize_linux_disk(parts):
+    device = parts[0]
+    fstype = parts[1]
+    total_kb = float(parts[2])
+    used_kb = float(parts[3])
+    avail_kb = float(parts[4])
+    usage_percent = float(parts[5].strip("%"))
+    mountpoint = parts[6]
+    return [{
+        "device": device,
+        "mountpoint": mountpoint,
+        "fstype": fstype,
+        "total_gb": round(total_kb / 1048576, 2),
+        "used_gb": round(used_kb / 1048576, 2),
+        "free_gb": round(avail_kb / 1048576, 2),
+        "usage_percent": round(usage_percent, 2),
+        "timestamp": datetime.now().isoformat(),
+    }]
 
 def get_linux_remote_data_disk(
     server: str,
@@ -241,100 +340,16 @@ def get_linux_remote_data_disk(
 ) -> Tuple[str, str, str, List[Dict]]:
     if paramiko is None:
         raise RuntimeError("paramiko is not installed. Install with: pip install paramiko")
-
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
     try:
-        key_path = key_path.strip()
-        connected = False
-        last_error: Exception | None = None
-
-        if key_path:
-            expanded_key_path = os.path.expandvars(os.path.expanduser(key_path))
-            if not os.path.exists(expanded_key_path):
-                raise RuntimeError(f"SSH key file not found: {expanded_key_path}")
-            try:
-                client.connect(
-                    hostname=server,
-                    port=port,
-                    username=username,
-                    key_filename=expanded_key_path,
-                    passphrase=key_passphrase or None,
-                    look_for_keys=False,
-                    allow_agent=allow_agent,
-                    timeout=20,
-                )
-                connected = True
-            except Exception as exc:
-                last_error = exc
-                logging.warning(
-                    "%s: SSH key authentication failed. %s",
-                    server,
-                    "Trying password fallback." if password else "No password fallback configured.",
-                )
-
-        if not connected and password:
-            try:
-                client.connect(
-                    hostname=server,
-                    port=port,
-                    username=username,
-                    password=password,
-                    look_for_keys=False,
-                    allow_agent=False,
-                    timeout=20,
-                )
-                connected = True
-            except Exception as exc:
-                last_error = exc
-
-        if not connected:
-            if last_error:
-                raise RuntimeError(f"SSH authentication failed: {last_error}")
-            raise RuntimeError("SSH authentication failed: no usable key or password provided")
-
-        stdin, stdout, stderr = client.exec_command("hostname")
-        server_name = stdout.read().decode("utf-8", errors="ignore").strip() or server
-        _ = stdin
-
-        _, stdout, _ = client.exec_command("cat /etc/redhat-release 2>/dev/null || uname -srv")
-        os_version = stdout.read().decode("utf-8", errors="ignore").strip() or "RHEL"
-
-        # POSIX output makes parsing predictable across RHEL variants.
-        _, stdout, stderr = client.exec_command("df -PkT /data 2>/dev/null | tail -n 1")
-        line = stdout.read().decode("utf-8", errors="ignore").strip()
-        err = stderr.read().decode("utf-8", errors="ignore").strip()
-        if not line:
-            if err:
-                logging.warning("%s: /data lookup warning: %s", server, err)
+        _ssh_connect(client, server, username, password, key_path, key_passphrase, allow_agent, port)
+        server_name = _ssh_get_hostname(client, server)
+        os_version = _ssh_get_os_version(client)
+        parts = _ssh_query_data_disk(client, server)
+        if not parts:
             return server_name, server, os_version, []
-
-        parts = line.split()
-        if len(parts) < 7:
-            raise RuntimeError(f"Unexpected df output for {server}: {line}")
-
-        device = parts[0]
-        fstype = parts[1]
-        total_kb = float(parts[2])
-        used_kb = float(parts[3])
-        avail_kb = float(parts[4])
-        usage_percent = float(parts[5].strip("%"))
-        mountpoint = parts[6]
-
-        disk_info = [
-            {
-                "device": device,
-                "mountpoint": mountpoint,
-                "fstype": fstype,
-                "total_gb": round(total_kb / 1048576, 2),
-                "used_gb": round(used_kb / 1048576, 2),
-                "free_gb": round(avail_kb / 1048576, 2),
-                "usage_percent": round(usage_percent, 2),
-                "timestamp": datetime.now().isoformat(),
-            }
-        ]
-
+        disk_info = _normalize_linux_disk(parts)
         return server_name, server, os_version, disk_info
     finally:
         client.close()
